@@ -82,32 +82,6 @@ def generate():
         })
 
 
- raw = completion.choices[0].message["content"]
-
-import json, re
-
-# Пытаемся вытащить JSON из текста GPT
-match = re.search(r"\{.*\}", raw, re.DOTALL)
-if match:
-    try:
-        obj = json.loads(match.group(0))
-        return jsonify(obj)
-    except:
-        pass
-
-# Fallback — если GPT ответил не JSON
-return jsonify({
-    "title": base_meaning[:40],
-    "description": base_meaning or "Сделай небольшой шаг."
-})
-
-
-    except:
-        return jsonify({
-            "title": base_meaning[:40],
-            "description": base_meaning or "Сделай небольшой шаг."
-        })
-
 @app.route("/")
 def root():
     return {"status": "habit-ai-server running"}
