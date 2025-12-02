@@ -56,42 +56,40 @@ def generate():
 """
 
         # ================= OpenAI запрос =================
-        completion = client.chat.completions.create(
-            model="gpt-5.1",
+        try:
+    completion = client.chat.completions.create(
+        model="gpt-5.1",
+        messages=[
+            {"role": "system", "content": "Ты генератор коротких текстов."},
+            {"role": "user", "content": prompt}
+        ],
+        max_completion_tokens=150,
+        temperature=0.8
+    )
 
-            messages=[
-                {"role": "system", "content": "Ты генератор коротких текстов."},
-                {"role": "user", "content": prompt}
-            ],
-            max_tokens=150,
-            temperature=0.8
-        )
+    raw = completion.choices[0].message.content
 
-        # Новый SDK: content получаем так!
-        raw = completion.choices[0].message.content
+    import json, re
+    match = re.search(r"\{.*\}", raw, re.DOTALL)
+    if match:
+        try:
+            obj = json.loads(match.group(0))
+            return jsonify(obj)
+        except:
+            pass
 
-        # ================= JSON-парсер =================
-        match = re.search(r"\{.*\}", raw, re.DOTALL)
-        if match:
-            try:
-                obj = json.loads(match.group(0))
-                return jsonify(obj)
-            except json.JSONDecodeError:
-                pass
+    return jsonify({
+        "title": base_meaning[:40],
+        "description": base_meaning or fallback
+    })
 
-        # fallback если модель не смогла отдать JSON
-        return jsonify({
-            "title": base_meaning[:40],
-            "description": base_meaning or "Сделай небольшой шаг."
-        })
+except Exception as err:
+    print("OPENAI ERROR:", err)
+    return jsonify({
+        "title": base_meaning[:40],
+        "description": base_meaning or fallback
+    })
 
-    except Exception as e:
-        print("OPENAI ERROR:", e)
-
-        return jsonify({
-            "title": base_meaning[:40],
-            "description": base_meaning or "Сделай небольшой шаг."
-        })
 
 
 # =============================================================
