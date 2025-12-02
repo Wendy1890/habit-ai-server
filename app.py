@@ -57,7 +57,8 @@ def generate():
 
         # ================= OpenAI запрос =================
         completion = client.chat.completions.create(
-            model="gpt-4o-mini",
+            model="model="gpt-5.1",
+
             messages=[
                 {"role": "system", "content": "Ты генератор коротких текстов."},
                 {"role": "user", "content": prompt}
