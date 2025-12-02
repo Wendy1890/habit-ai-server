@@ -6,7 +6,9 @@ from flask import Flask, request, jsonify
 from dotenv import load_dotenv
 from openai import OpenAI
 
-# Загружаем .env
+# -------------------------------------------------------------
+#                    LOAD ENV
+# -------------------------------------------------------------
 load_dotenv()
 
 API_KEY = os.getenv("OPENAI_API_KEY")
@@ -17,9 +19,9 @@ client = OpenAI(api_key=API_KEY)
 app = Flask(__name__)
 
 
-# =============================================================
-#                     /generate  — API метод
-# =============================================================
+# -------------------------------------------------------------
+#                  /generate — MAIN ENDPOINT
+# -------------------------------------------------------------
 @app.route("/generate", methods=["POST"])
 def generate():
     try:
@@ -30,17 +32,19 @@ def generate():
         energy = data.get("energy")
         engagement = data.get("engagement")
         session_type = data.get("sessionType")
-        base_meaning = data.get("baseMeaning")
+        base_meaning = data.get("baseMeaning", "")
         language = data.get("language", "RU")
 
+        # -------- Language instruction --------
         lang_instruction = (
             "Пиши текст только на русском языке."
-            if language == "RU" else
-            "Write text only in English."
+            if language.upper() == "RU"
+            else "Write text only in English."
         )
 
+        # -------- Prompt --------
         prompt = f"""
-Ты пишешь короткие тексты для приложения о здоровье и привычках.
+Ты пишешь короткие, ёмкие тексты для приложения о здоровье.
 {lang_instruction}
 
 Дано:
@@ -51,57 +55,67 @@ def generate():
 - Спец-режим: {session_type}
 - Базовый смысл: {base_meaning}
 
-Верни JSON строго формата:
+Верни JSON строго вида:
 {{"title": "...", "description": "..."}}
 """
 
-        # ================= OpenAI запрос =================
+        # -----------------------------------------------------
+        #                 OPENAI REQUEST
+        # -----------------------------------------------------
         try:
-    completion = client.chat.completions.create(
-        model="gpt-5.1",
-        messages=[
-            {"role": "system", "content": "Ты генератор коротких текстов."},
-            {"role": "user", "content": prompt}
-        ],
-        max_completion_tokens=150,
-        temperature=0.8
-    )
+            completion = client.chat.completions.create(
+                model="gpt-5.1",
+                messages=[
+                    {"role": "system", "content": "Ты генератор коротких текстов."},
+                    {"role": "user", "content": prompt}
+                ],
+                max_completion_tokens=150,
+                temperature=0.8
+            )
 
-    raw = completion.choices[0].message.content
+            raw = completion.choices[0].message.content
+            print("RAW:", raw)
 
-    import json, re
-    match = re.search(r"\{.*\}", raw, re.DOTALL)
-    if match:
-        try:
-            obj = json.loads(match.group(0))
-            return jsonify(obj)
-        except:
-            pass
+            # Try extracting JSON via regex
+            match = re.search(r"\{.*\}", raw, re.DOTALL)
+            if match:
+                try:
+                    obj = json.loads(match.group(0))
+                    return jsonify(obj)
+                except Exception as e:
+                    print("JSON PARSE ERROR:", e)
 
-    return jsonify({
-        "title": base_meaning[:40],
-        "description": base_meaning or fallback
-    })
+            # fallback
+            return jsonify({
+                "title": base_meaning[:40] or "Advice",
+                "description": base_meaning or "Сделай небольшой шаг."
+            })
 
-except Exception as err:
-    print("OPENAI ERROR:", err)
-    return jsonify({
-        "title": base_meaning[:40],
-        "description": base_meaning or fallback
-    })
+        except Exception as e:
+            print("OPENAI ERROR:", e)
+            return jsonify({
+                "title": base_meaning[:40] or "Advice",
+                "description": base_meaning or "Сделай небольшой шаг."
+            })
+
+    except Exception as e:
+        print("SERVER ERROR:", e)
+        return jsonify({
+            "title": "Error",
+            "description": "Internal server error"
+        })
 
 
-
-# =============================================================
-#                       health check
-# =============================================================
+# -------------------------------------------------------------
+#                       HEALTH CHECK
+# -------------------------------------------------------------
 @app.route("/")
 def root():
     return {"status": "habit-ai-server running"}
 
 
-# =============================================================
-#                       RUN (локально)
-# =============================================================
+# -------------------------------------------------------------
+#                       RUN LOCAL
+# -------------------------------------------------------------
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080)
