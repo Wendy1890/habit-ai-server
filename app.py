@@ -1,11 +1,13 @@
-# app.py
 import os
 import json
 import re
 import random
-from flask import Flask, request, jsonify, make_response
+from flask import Flask, request, jsonify
+from flask_sqlalchemy import SQLAlchemy
+from flask_cors import CORS
 from dotenv import load_dotenv
 import openai
+from datetime import datetime
 
 # -------------------------------------------------------------
 #                    LOAD ENV & INIT APP
@@ -16,138 +18,172 @@ API_KEY = os.getenv("OPENAI_API_KEY")
 if not API_KEY:
     raise Exception("OPENAI_API_KEY not found!")
 
-# Инициализация OpenAI с совместимой версией
 openai.api_key = API_KEY
-
 app = Flask(__name__)
-
-# Включаем CORS для Android
-@app.after_request
-def after_request(response):
-    response.headers.add('Access-Control-Allow-Origin', '*')
-    response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization')
-    response.headers.add('Access-Control-Allow-Methods', 'GET,PUT,POST,DELETE,OPTIONS')
-    return response
+CORS(app)  # Включаем CORS для Android
 
 # -------------------------------------------------------------
-#                    IN-MEMORY TEMPLATES (вместо БД)
+#                    DATABASE CONFIG (Railway PostgreSQL)
 # -------------------------------------------------------------
-CARD_TEMPLATES = [
-    {
-        "id": 1,
-        "category": "дыхание",
-        "base_text": "Сделай {N} глубоких вдохов через нос и медленных выдохов через рот",
-        "difficulty": "легко",
-        "duration": 120,
-        "tags": ["релакс", "офис", "стресс"],
-        "language": "RU"
-    },
-    {
-        "id": 2,
-        "category": "шея_плечи",
-        "base_text": "Повращай плечами {N} раз вперед и {N} раз назад",
-        "difficulty": "легко",
-        "duration": 180,
-        "tags": ["разминка", "офис", "сидячая работа"],
-        "language": "RU"
-    },
-    {
-        "id": 3,
-        "category": "осанка",
-        "base_text": "Выпрями спину и удерживай правильную осанку {N} минут",
-        "difficulty": "средне",
-        "duration": 300,
-        "tags": ["осанка", "работа", "здоровье спины"],
-        "language": "RU"
-    },
-    {
-        "id": 4,
-        "category": "глаза",
-        "base_text": "Отведи взгляд от экрана и сфокусируйся на удаленном объекте {N} секунд",
-        "difficulty": "легко",
-        "duration": 60,
-        "tags": ["зрение", "отдых", "экран"],
-        "language": "RU"
-    },
-    {
-        "id": 5,
-        "category": "ноги",
-        "base_text": "Встань и потянись, подняв руки вверх на {N} секунд",
-        "difficulty": "легко",
-        "duration": 90,
-        "tags": ["разминка", "перерыв", "кровообращение"],
-        "language": "RU"
-    }
-]
+DATABASE_URL = os.getenv('DATABASE_URL', '')
 
-EN_TEMPLATES = [
-    {
-        "id": 6,
-        "category": "breathing",
-        "base_text": "Take {N} deep breaths through your nose and slow exhales through your mouth",
-        "difficulty": "easy",
-        "duration": 120,
-        "tags": ["relax", "office", "stress"],
-        "language": "EN"
-    },
-    {
-        "id": 7,
-        "category": "neck_shoulders",
-        "base_text": "Rotate your shoulders {N} times forward and {N} times backward",
-        "difficulty": "easy",
-        "duration": 180,
-        "tags": ["warmup", "office", "sitting"],
-        "language": "EN"
-    },
-    {
-        "id": 8,
-        "category": "posture",
-        "base_text": "Straighten your back and maintain correct posture for {N} minutes",
-        "difficulty": "medium",
-        "duration": 300,
-        "tags": ["posture", "work", "back health"],
-        "language": "EN"
-    }
-]
+if DATABASE_URL:
+    # Конвертируем для SQLAlchemy
+    if DATABASE_URL.startswith('postgres://'):
+        DATABASE_URL = DATABASE_URL.replace('postgres://', 'postgresql://', 1)
+    app.config['SQLALCHEMY_DATABASE_URI'] = DATABASE_URL
+    print(f"✅ Using PostgreSQL: {DATABASE_URL.split('@')[1] if '@' in DATABASE_URL else 'Connected'}")
+else:
+    # Fallback to SQLite (для локальной разработки)
+    app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///cards.db'
+    print("⚠️ Using SQLite (no DATABASE_URL found)")
 
-ALL_TEMPLATES = CARD_TEMPLATES + EN_TEMPLATES
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+db = SQLAlchemy(app)
+
+# -------------------------------------------------------------
+#                    DATABASE MODELS
+# -------------------------------------------------------------
+class CardTemplate(db.Model):
+    __tablename__ = 'card_templates'
+    
+    id = db.Column(db.Integer, primary_key=True)
+    category = db.Column(db.String(100), nullable=False)
+    base_text = db.Column(db.Text, nullable=False)
+    difficulty = db.Column(db.String(50), default='легко')
+    duration = db.Column(db.Integer, default=300)
+    tags = db.Column(db.String(500), default='')
+    language = db.Column(db.String(10), default='RU')
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'category': self.category,
+            'base_text': self.base_text,
+            'difficulty': self.difficulty,
+            'duration': self.duration,
+            'tags': self.tags.split(',') if self.tags else [],
+            'language': self.language,
+            'created_at': self.created_at.isoformat()
+        }
+
+class GeneratedCard(db.Model):
+    __tablename__ = 'generated_cards'
+    
+    id = db.Column(db.Integer, primary_key=True)
+    template_id = db.Column(db.Integer, nullable=False)
+    title = db.Column(db.String(200), nullable=False)
+    description = db.Column(db.Text, nullable=False)
+    category = db.Column(db.String(100), nullable=False)
+    duration = db.Column(db.Integer, nullable=False)
+    difficulty = db.Column(db.String(50), nullable=False)
+    language = db.Column(db.String(10), default='RU')
+    is_ai_generated = db.Column(db.Boolean, default=True)
+    user_goal = db.Column(db.String(200))
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'template_id': self.template_id,
+            'title': self.title,
+            'description': self.description,
+            'category': self.category,
+            'duration': self.duration,
+            'difficulty': self.difficulty,
+            'language': self.language,
+            'is_ai_generated': self.is_ai_generated,
+            'user_goal': self.user_goal,
+            'created_at': self.created_at.isoformat()
+        }
+
+# -------------------------------------------------------------
+#                    INIT DATABASE
+# -------------------------------------------------------------
+with app.app_context():
+    db.create_all()
+    
+    # Добавляем демо-шаблоны если таблица пустая
+    if CardTemplate.query.count() == 0:
+        add_sample_templates()
+        print("✅ Added sample templates to database")
+
+def add_sample_templates():
+    """Добавляем примеры шаблонов в БД"""
+    samples = [
+        CardTemplate(
+            category="дыхание",
+            base_text="Сделай {N} глубоких вдохов через нос и медленных выдохов через рот",
+            difficulty="легко",
+            duration=120,
+            tags="релакс,офис,стресс",
+            language="RU"
+        ),
+        CardTemplate(
+            category="шея_плечи",
+            base_text="Повращай плечами {N} раз вперед и {N} раз назад",
+            difficulty="легко",
+            duration=180,
+            tags="разминка,офис,сидячая работа",
+            language="RU"
+        ),
+        CardTemplate(
+            category="осанка",
+            base_text="Выпрями спину и удерживай правильную осанку {N} минут",
+            difficulty="средне",
+            duration=300,
+            tags="осанка,работа,здоровье спины",
+            language="RU"
+        ),
+        CardTemplate(
+            category="глаза",
+            base_text="Отведи взгляд от экрана и сфокусируйся на удаленном объекте {N} секунд",
+            difficulty="легко",
+            duration=60,
+            tags="зрение,отдых,экран",
+            language="RU"
+        )
+    ]
+    
+    for sample in samples:
+        db.session.add(sample)
+    
+    db.session.commit()
 
 # -------------------------------------------------------------
 #                    HELPER FUNCTIONS
 # -------------------------------------------------------------
-def generate_ai_variation(template, user_goal, energy, language):
-    """Генерирует вариацию на основе шаблона через OpenAI"""
+def generate_with_openai(template, goal, energy, language):
+    """Генерирует вариацию через OpenAI"""
     
-    lang_instruction = "Пиши на русском языке." if language == "RU" else "Write in English."
+    lang_text = "русском" if language == "RU" else "английском"
     n_value = random.randint(3, 10)
     
     prompt = f"""
-{lang_instruction}
+Напиши на {lang_text} языке.
 
-ИСХОДНЫЙ ШАБЛОН: "{template['base_text']}"
-Категория: {template['category']}
-Сложность: {template['difficulty']}
-Длительность: {template['duration']} секунд
+Шаблон упражнения: "{template.base_text}"
+Категория: {template.category}
+Длительность: {template.duration} секунд
 
-ЦЕЛЬ ПОЛЬЗОВАТЕЛЯ: {user_goal}
-УРОВЕНЬ ЭНЕРГИИ: {energy}
+Цель пользователя: {goal}
+Уровень энергии: {energy}
 
-Создай 1 вариацию этого упражнения для мобильного приложения:
-- Замени {{N}} на число {n_value}
-- Сделай текст мотивирующим и дружелюбным
-- Сохрани суть упражнения
-- Добавь небольшую деталь или совет
+Создай интересную вариацию этого упражнения:
+- Используй число {n_value} вместо {{N}}
+- Сделай текст мотивирующим
+- Добавь полезный совет
 
-Формат ответа ТОЛЬКО JSON:
+Формат JSON:
 {{
-    "title": "Короткое название (2-4 слова)",
-    "description": "Подробная инструкция",
+    "title": "Короткое название",
+    "description": "Полное описание",
     "duration": число
 }}
 """
     
     try:
-        # Используем старый API для совместимости
         response = openai.ChatCompletion.create(
             model="gpt-3.5-turbo",
             messages=[
@@ -158,29 +194,26 @@ def generate_ai_variation(template, user_goal, energy, language):
             max_tokens=200
         )
         
-        raw_response = response.choices[0].message.content
-        print(f"AI Response: {raw_response}")
+        raw = response.choices[0].message.content
+        match = re.search(r"\{.*\}", raw, re.DOTALL)
         
-        # Парсим JSON
-        match = re.search(r"\{.*\}", raw_response, re.DOTALL)
         if match:
-            ai_response = json.loads(match.group(0))
-            
+            data = json.loads(match.group(0))
             return {
-                "title": ai_response.get("title", template['category']),
-                "description": ai_response.get("description", template['base_text'].replace("{N}", str(n_value))),
-                "duration": ai_response.get("duration", template['duration']),
+                "title": data.get("title", template.category),
+                "description": data.get("description", template.base_text.replace("{N}", str(n_value))),
+                "duration": data.get("duration", template.duration),
                 "is_ai_generated": True
             }
-        
+            
     except Exception as e:
         print(f"OpenAI error: {e}")
     
     # Fallback
     return {
-        "title": template['category'],
-        "description": template['base_text'].replace("{N}", str(n_value)),
-        "duration": template['duration'],
+        "title": template.category,
+        "description": template.base_text.replace("{N}", str(random.randint(3, 10))),
+        "duration": template.duration,
         "is_ai_generated": False
     }
 
@@ -188,199 +221,94 @@ def generate_ai_variation(template, user_goal, energy, language):
 #                    API ENDPOINTS
 # -------------------------------------------------------------
 
-# -------------------------------------------------------------
-#                  /generate — ОРИГИНАЛЬНЫЙ ENDPOINT
-# -------------------------------------------------------------
-@app.route("/generate", methods=["POST", "OPTIONS"])
-def generate():
-    if request.method == "OPTIONS":
-        return make_response('', 200)
+@app.route("/")
+def health():
+    templates_count = CardTemplate.query.count()
+    generated_count = GeneratedCard.query.count()
     
+    return jsonify({
+        "status": "🚀 Server is running",
+        "database": "PostgreSQL" if DATABASE_URL else "SQLite",
+        "templates": templates_count,
+        "generated_cards": generated_count
+    })
+
+# Основной endpoint для Android
+@app.route("/api/generate", methods=["POST"])
+def generate_card():
     try:
         data = request.json
-
         goal = data.get("goal", "Улучшить здоровье")
-        energy = data.get("energy", "средняя")
-        language = data.get("language", "RU").upper()
-        base_meaning = data.get("baseMeaning", "")
-
-        # Language instruction
-        lang_instruction = "Пиши текст только на русском языке." if language == "RU" else "Write text only in English."
-
-        # Prompt
-        prompt = f"""
-Ты пишешь короткие, ёмкие тексты для приложения о здоровье.
-{lang_instruction}
-
-Цель пользователя: {goal}
-Уровень энергии: {energy}
-
-Верни JSON строго вида:
-{{"title": "...", "description": "..."}}
-"""
-
-        try:
-            response = openai.ChatCompletion.create(
-                model="gpt-3.5-turbo",
-                messages=[
-                    {"role": "system", "content": "Ты генератор коротких текстов."},
-                    {"role": "user", "content": prompt}
-                ],
-                max_tokens=150,
-                temperature=0.8
-            )
-
-            raw = response.choices[0].message.content
-            print("RAW:", raw)
-
-            # Extract JSON
-            match = re.search(r"\{.*\}", raw, re.DOTALL)
-            if match:
-                try:
-                    obj = json.loads(match.group(0))
-                    return jsonify({
-                        "success": True,
-                        "card": obj
-                    })
-                except Exception as e:
-                    print("JSON parse error:", e)
-
-            # Fallback
-            return jsonify({
-                "success": True,
-                "card": {
-                    "title": base_meaning[:40] or "Advice",
-                    "description": base_meaning or "Сделай небольшой шаг."
-                }
-            })
-
-        except Exception as e:
-            print("OpenAI error:", e)
-            return jsonify({
-                "success": True,
-                "card": {
-                    "title": base_meaning[:40] or "Advice",
-                    "description": base_meaning or "Сделай небольшой шаг."
-                }
-            })
-
-    except Exception as e:
-        print("Server error:", e)
-        return jsonify({
-            "success": False,
-            "error": "Internal server error",
-            "message": str(e)
-        }), 500
-
-# -------------------------------------------------------------
-#          POST /api/generate-card — ОСНОВНОЙ ДЛЯ ANDROID
-# -------------------------------------------------------------
-@app.route("/api/generate-card", methods=["POST", "OPTIONS"])
-def generate_card_from_template():
-    if request.method == "OPTIONS":
-        return make_response('', 200)
-    
-    try:
-        data = request.json
+        language = data.get("language", "RU")
         
-        # Параметры
-        user_goal = data.get("goal", "Улучшить здоровье")
-        category = data.get("category")
-        energy = data.get("energy", "средняя")
-        language = data.get("language", "RU").upper()
-        user_id = data.get("user_id")
-        
-        # Выбираем шаблоны по языку
-        templates = [t for t in ALL_TEMPLATES if t['language'] == language]
-        
-        if category:
-            templates = [t for t in templates if t['category'] == category]
-        
+        # Получаем случайный шаблон из БД
+        templates = CardTemplate.query.filter_by(language=language).all()
         if not templates:
             return jsonify({
                 "success": False,
-                "error": f"No templates for language: {language}"
+                "error": "No templates found"
             }), 404
         
-        # Случайный шаблон
         template = random.choice(templates)
         
-        # Генерируем вариацию
-        generated = generate_ai_variation(template, user_goal, energy, language)
+        # Генерируем через OpenAI
+        generated = generate_with_openai(template, goal, "medium", language)
         
-        # Формируем ответ
-        response = {
+        # Сохраняем в БД
+        new_card = GeneratedCard(
+            template_id=template.id,
+            title=generated["title"],
+            description=generated["description"],
+            category=template.category,
+            duration=generated["duration"],
+            difficulty=template.difficulty,
+            language=language,
+            is_ai_generated=generated["is_ai_generated"],
+            user_goal=goal
+        )
+        
+        db.session.add(new_card)
+        db.session.commit()
+        
+        return jsonify({
             "success": True,
-            "card": {
-                "id": template['id'],
-                "template_id": template['id'],
-                "title": generated['title'],
-                "description": generated['description'],
-                "category": template['category'],
-                "duration": generated['duration'],
-                "difficulty": template['difficulty'],
-                "tags": template['tags'],
-                "language": language,
-                "is_ai_generated": generated['is_ai_generated'],
-                "energy_level": energy,
-                "user_goal": user_goal,
-                "created_at": "2024-01-01T00:00:00Z"  # Для совместимости
-            }
-        }
-        
-        return jsonify(response)
+            "card": new_card.to_dict()
+        })
         
     except Exception as e:
         print(f"Error: {e}")
         return jsonify({
             "success": False,
-            "error": "Failed to generate card",
-            "message": str(e)
-        }), 500
-
-# -------------------------------------------------------------
-#          GET /api/templates — получить шаблоны
-# -------------------------------------------------------------
-@app.route("/api/templates", methods=["GET"])
-def get_templates():
-    try:
-        language = request.args.get('language', 'RU')
-        templates = [t for t in ALL_TEMPLATES if t['language'] == language]
-        
-        return jsonify({
-            "success": True,
-            "count": len(templates),
-            "templates": templates
-        })
-    except Exception as e:
-        return jsonify({
-            "success": False,
             "error": str(e)
         }), 500
 
-# -------------------------------------------------------------
-#                  HEALTH CHECK
-# -------------------------------------------------------------
-@app.route("/")
-def root():
+# Получить все шаблоны
+@app.route("/api/templates", methods=["GET"])
+def get_templates():
+    language = request.args.get("language", "RU")
+    templates = CardTemplate.query.filter_by(language=language).all()
+    
     return jsonify({
-        "status": "habit-ai-server running",
-        "version": "2.0",
-        "templates_count": len(ALL_TEMPLATES),
-        "endpoints": {
-            "GET /": "Health check",
-            "POST /generate": "Legacy OpenAI generation",
-            "POST /api/generate-card": "Generate from templates (for Android)",
-            "GET /api/templates": "Get all templates"
-        }
+        "success": True,
+        "templates": [t.to_dict() for t in templates]
+    })
+
+# Получить историю генераций
+@app.route("/api/history", methods=["GET"])
+def get_history():
+    limit = request.args.get("limit", 50, type=int)
+    cards = GeneratedCard.query.order_by(GeneratedCard.created_at.desc()).limit(limit).all()
+    
+    return jsonify({
+        "success": True,
+        "cards": [c.to_dict() for c in cards]
     })
 
 # -------------------------------------------------------------
-#                       RUN APP
+#                    RUN SERVER
 # -------------------------------------------------------------
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8080))
-    print(f"🚀 Starting server on port {port}")
-    print(f"📋 Templates loaded: {len(ALL_TEMPLATES)}")
-    print(f"🔑 OpenAI API Key: {'Loaded' if API_KEY else 'Missing'}")
-    app.run(host="0.0.0.0", port=port, debug=True)
+    print(f"✅ Server starting on port {port}")
+    print(f"✅ Database: {'PostgreSQL' if DATABASE_URL else 'SQLite'}")
+    app.run(host="0.0.0.0", port=port, debug=False)
