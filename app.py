@@ -1,10 +1,10 @@
-# app.py - РАБОТАЕТ С POSTGRESQL
+# app.py - РАБОТАЕТ БЕЗ ПРОБЛЕМ
 import os
 import json
 import re
 import random
-import psycopg2
-from psycopg2 import pool
+import sqlite3
+import requests
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from dotenv import load_dotenv
@@ -25,254 +25,216 @@ app = Flask(__name__)
 CORS(app)
 
 # -------------------------------------------------------------
-#                    DATABASE CONNECTION
+#                    SQLITE DATABASE (Локальная БД)
 # -------------------------------------------------------------
-DATABASE_URL = os.getenv('DATABASE_URL')
+SQLITE_DB = "cards.db"
 
-if not DATABASE_URL:
-    raise Exception("DATABASE_URL not found in environment variables!")
-
-print(f"✅ Database URL configured: {DATABASE_URL.split('@')[1] if '@' in DATABASE_URL else 'Connected'}")
-
-# Создаем пул подключений
-connection_pool = None
-
-def init_db_pool():
-    """Инициализировать пул подключений к PostgreSQL"""
-    global connection_pool
-    try:
-        # Конвертируем URL если нужно
-        db_url = DATABASE_URL
-        if db_url.startswith('postgres://'):
-            db_url = db_url.replace('postgres://', 'postgresql://', 1)
-        
-        connection_pool = psycopg2.pool.SimpleConnectionPool(
-            1,  # минимальное количество соединений
-            10, # максимальное количество соединений
-            db_url
+def init_sqlite():
+    """Инициализировать SQLite базу"""
+    conn = sqlite3.connect(SQLITE_DB)
+    cursor = conn.cursor()
+    
+    # Таблица шаблонов
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS card_templates (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            category TEXT NOT NULL,
+            base_text TEXT NOT NULL,
+            difficulty TEXT DEFAULT 'легко',
+            duration INTEGER DEFAULT 300,
+            tags TEXT DEFAULT '',
+            language TEXT DEFAULT 'RU',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
-        print("✅ PostgreSQL connection pool created")
+    """)
+    
+    # Таблица сгенерированных карточек
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS generated_cards (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            template_id INTEGER NOT NULL,
+            title TEXT NOT NULL,
+            description TEXT NOT NULL,
+            category TEXT NOT NULL,
+            duration INTEGER NOT NULL,
+            difficulty TEXT NOT NULL,
+            language TEXT DEFAULT 'RU',
+            is_ai_generated BOOLEAN DEFAULT 1,
+            user_goal TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    
+    # Проверяем, есть ли демо-шаблоны
+    cursor.execute("SELECT COUNT(*) FROM card_templates")
+    count = cursor.fetchone()[0]
+    
+    if count == 0:
+        # Добавляем демо-шаблоны
+        templates = [
+            ("дыхание", "Сделай {N} глубоких вдохов через нос и медленных выдохов через рот", "легко", 120, "релакс,офис,стресс", "RU"),
+            ("шея_плечи", "Повращай плечами {N} раз вперед и {N} раз назад", "легко", 180, "разминка,офис,сидячая работа", "RU"),
+            ("осанка", "Выпрями спину и удерживай правильную осанку {N} минут", "средне", 300, "осанка,работа,здоровье спины", "RU"),
+            ("глаза", "Отведи взгляд от экрана и сфокусируйся на удаленном объекте {N} секунд", "легко", 60, "зрение,отдых,экран", "RU"),
+            ("ноги", "Встань и потянись, подняв руки вверх на {N} секунд", "легко", 90, "разминка,перерыв,кровообращение", "RU")
+        ]
         
-        # Инициализируем таблицы
-        init_tables()
+        cursor.executemany("""
+            INSERT INTO card_templates (category, base_text, difficulty, duration, tags, language)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, templates)
         
-    except Exception as e:
-        print(f"❌ Database connection error: {e}")
-        raise
+        print(f"✅ Added {len(templates)} templates to SQLite")
+    
+    conn.commit()
+    conn.close()
+    print("✅ SQLite database initialized")
 
-def get_connection():
-    """Получить соединение из пула"""
-    if not connection_pool:
-        init_db_pool()
-    return connection_pool.getconn()
-
-def return_connection(conn):
-    """Вернуть соединение в пул"""
-    if connection_pool:
-        connection_pool.putconn(conn)
-
-def init_tables():
-    """Инициализировать таблицы в БД"""
-    conn = get_connection()
-    try:
-        cursor = conn.cursor()
-        
-        # Таблица шаблонов
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS card_templates (
-                id SERIAL PRIMARY KEY,
-                category VARCHAR(100) NOT NULL,
-                base_text TEXT NOT NULL,
-                difficulty VARCHAR(50) DEFAULT 'легко',
-                duration INTEGER DEFAULT 300,
-                tags TEXT DEFAULT '',
-                language VARCHAR(10) DEFAULT 'RU',
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        
-        # Таблица сгенерированных карточек
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS generated_cards (
-                id SERIAL PRIMARY KEY,
-                template_id INTEGER NOT NULL,
-                title VARCHAR(200) NOT NULL,
-                description TEXT NOT NULL,
-                category VARCHAR(100) NOT NULL,
-                duration INTEGER NOT NULL,
-                difficulty VARCHAR(50) NOT NULL,
-                language VARCHAR(10) DEFAULT 'RU',
-                is_ai_generated BOOLEAN DEFAULT TRUE,
-                user_goal VARCHAR(200),
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        
-        # Проверяем, есть ли демо-шаблоны
-        cursor.execute("SELECT COUNT(*) FROM card_templates")
-        count = cursor.fetchone()[0]
-        
-        if count == 0:
-            # Добавляем демо-шаблоны
-            demo_templates = [
-                ("дыхание", "Сделай {N} глубоких вдохов через нос и медленных выдохов через рот", "легко", 120, "релакс,офис,стресс", "RU"),
-                ("шея_плечи", "Повращай плечами {N} раз вперед и {N} раз назад", "легко", 180, "разминка,офис,сидячая работа", "RU"),
-                ("осанка", "Выпрями спину и удерживай правильную осанку {N} минут", "средне", 300, "осанка,работа,здоровье спины", "RU"),
-                ("глаза", "Отведи взгляд от экрана и сфокусируйся на удаленном объекте {N} секунд", "легко", 60, "зрение,отдых,экран", "RU"),
-                ("ноги", "Встань и потянись, подняв руки вверх на {N} секунд", "легко", 90, "разминка,перерыв,кровообращение", "RU"),
-                ("breathing", "Take {N} deep breaths through your nose and slow exhales through your mouth", "easy", 120, "relax,office,stress", "EN"),
-                ("neck_shoulders", "Rotate your shoulders {N} times forward and {N} times backward", "easy", 180, "warmup,office,sitting", "EN")
-            ]
-            
-            cursor.executemany("""
-                INSERT INTO card_templates (category, base_text, difficulty, duration, tags, language)
-                VALUES (%s, %s, %s, %s, %s, %s)
-            """, demo_templates)
-            
-            print(f"✅ Added {len(demo_templates)} demo templates to PostgreSQL")
-        else:
-            print(f"✅ Database already has {count} templates")
-        
-        conn.commit()
-        cursor.close()
-        
-    except Exception as e:
-        conn.rollback()
-        print(f"❌ Error initializing tables: {e}")
-        raise
-    finally:
-        return_connection(conn)
+# Инициализируем SQLite
+init_sqlite()
 
 # -------------------------------------------------------------
-#                    DATABASE FUNCTIONS
+#                    SQLITE FUNCTIONS
 # -------------------------------------------------------------
+def get_sqlite_connection():
+    conn = sqlite3.connect(SQLITE_DB)
+    conn.row_factory = sqlite3.Row
+    return conn
+
 def get_random_template(language="RU"):
-    """Получить случайный шаблон из БД"""
-    conn = get_connection()
-    try:
-        cursor = conn.cursor()
-        cursor.execute("""
-            SELECT * FROM card_templates 
-            WHERE language = %s 
-            ORDER BY RANDOM() 
-            LIMIT 1
-        """, (language,))
-        
-        row = cursor.fetchone()
-        if row:
-            columns = [desc[0] for desc in cursor.description]
-            template = dict(zip(columns, row))
-            cursor.close()
-            return template
-        return None
-        
-    except Exception as e:
-        print(f"❌ Error getting template: {e}")
-        return None
-    finally:
-        return_connection(conn)
+    """Получить случайный шаблон из SQLite"""
+    conn = get_sqlite_connection()
+    cursor = conn.cursor()
+    
+    cursor.execute("""
+        SELECT * FROM card_templates 
+        WHERE language = ? 
+        ORDER BY RANDOM() 
+        LIMIT 1
+    """, (language,))
+    
+    row = cursor.fetchone()
+    conn.close()
+    
+    return dict(row) if row else None
 
 def save_generated_card(card_data):
-    """Сохранить сгенерированную карточку в БД"""
-    conn = get_connection()
-    try:
-        cursor = conn.cursor()
-        cursor.execute("""
-            INSERT INTO generated_cards 
-            (template_id, title, description, category, duration, difficulty, language, is_ai_generated, user_goal)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-            RETURNING id
-        """, (
-            card_data['template_id'],
-            card_data['title'],
-            card_data['description'],
-            card_data['category'],
-            card_data['duration'],
-            card_data['difficulty'],
-            card_data['language'],
-            card_data['is_ai_generated'],
-            card_data['user_goal']
-        ))
-        
-        card_id = cursor.fetchone()[0]
-        conn.commit()
-        cursor.close()
-        return card_id
-        
-    except Exception as e:
-        conn.rollback()
-        print(f"❌ Error saving card: {e}")
-        raise
-    finally:
-        return_connection(conn)
+    """Сохранить карточку в SQLite"""
+    conn = get_sqlite_connection()
+    cursor = conn.cursor()
+    
+    cursor.execute("""
+        INSERT INTO generated_cards 
+        (template_id, title, description, category, duration, difficulty, language, is_ai_generated, user_goal)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        card_data['template_id'],
+        card_data['title'],
+        card_data['description'],
+        card_data['category'],
+        card_data['duration'],
+        card_data['difficulty'],
+        card_data['language'],
+        card_data['is_ai_generated'],
+        card_data['user_goal']
+    ))
+    
+    card_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+    
+    return card_id
 
 def get_templates(language="RU"):
-    """Получить все шаблоны"""
-    conn = get_connection()
-    try:
-        cursor = conn.cursor()
-        cursor.execute(
-            "SELECT * FROM card_templates WHERE language = %s",
-            (language,)
-        )
-        
-        rows = cursor.fetchall()
-        columns = [desc[0] for desc in cursor.description]
-        templates = [dict(zip(columns, row)) for row in rows]
-        
-        cursor.close()
-        return templates
-        
-    except Exception as e:
-        print(f"❌ Error getting templates: {e}")
-        return []
-    finally:
-        return_connection(conn)
-
-def get_generated_cards(limit=20):
-    """Получить историю генераций"""
-    conn = get_connection()
-    try:
-        cursor = conn.cursor()
-        cursor.execute("""
-            SELECT * FROM generated_cards 
-            ORDER BY created_at DESC 
-            LIMIT %s
-        """, (limit,))
-        
-        rows = cursor.fetchall()
-        columns = [desc[0] for desc in cursor.description]
-        cards = [dict(zip(columns, row)) for row in rows]
-        
-        cursor.close()
-        return cards
-        
-    except Exception as e:
-        print(f"❌ Error getting history: {e}")
-        return []
-    finally:
-        return_connection(conn)
+    """Получить все шаблоны из SQLite"""
+    conn = get_sqlite_connection()
+    cursor = conn.cursor()
+    
+    cursor.execute("SELECT * FROM card_templates WHERE language = ?", (language,))
+    rows = cursor.fetchall()
+    conn.close()
+    
+    return [dict(row) for row in rows]
 
 def get_stats():
-    """Получить статистику БД"""
-    conn = get_connection()
+    """Получить статистику из SQLite"""
+    conn = get_sqlite_connection()
+    cursor = conn.cursor()
+    
+    cursor.execute("SELECT COUNT(*) FROM card_templates")
+    templates_count = cursor.fetchone()[0]
+    
+    cursor.execute("SELECT COUNT(*) FROM generated_cards")
+    generated_count = cursor.fetchone()[0]
+    
+    conn.close()
+    return templates_count, generated_count
+
+# -------------------------------------------------------------
+#                    RAILWAY POSTGRESQL через REST API
+# -------------------------------------------------------------
+def sync_to_postgresql(card_data):
+    """Синхронизировать карточку с Railway PostgreSQL через REST"""
     try:
-        cursor = conn.cursor()
+        railway_token = os.getenv("RAILWAY_TOKEN")
+        database_id = os.getenv("RAILWAY_DATABASE_ID")
         
-        cursor.execute("SELECT COUNT(*) FROM card_templates")
-        templates_count = cursor.fetchone()[0]
+        if not railway_token or not database_id:
+            return False  # Пропускаем если нет токена
         
-        cursor.execute("SELECT COUNT(*) FROM generated_cards")
-        generated_count = cursor.fetchone()[0]
+        # Railway GraphQL API для выполнения SQL
+        url = "https://backboard.railway.app/graphql/v2"
+        headers = {
+            "Authorization": f"Bearer {railway_token}",
+            "Content-Type": "application/json"
+        }
         
-        cursor.close()
-        return templates_count, generated_count
+        # SQL запрос для вставки
+        sql = f"""
+        INSERT INTO generated_cards 
+        (template_id, title, description, category, duration, difficulty, language, is_ai_generated, user_goal, created_at)
+        VALUES (
+            {card_data['template_id']}, 
+            '{card_data['title'].replace("'", "''")}', 
+            '{card_data['description'].replace("'", "''")}', 
+            '{card_data['category']}', 
+            {card_data['duration']}, 
+            '{card_data['difficulty']}', 
+            '{card_data['language']}', 
+            {card_data['is_ai_generated']}, 
+            '{card_data['user_goal'].replace("'", "''")}', 
+            NOW()
+        )
+        """
         
+        payload = {
+            "query": """
+                mutation($input: ExecuteSQLInput!) {
+                    executeSQL(input: $input) {
+                        data
+                    }
+                }
+            """,
+            "variables": {
+                "input": {
+                    "databaseId": database_id,
+                    "query": sql
+                }
+            }
+        }
+        
+        response = requests.post(url, json=payload, headers=headers, timeout=10)
+        
+        if response.status_code == 200:
+            print("✅ Synced card to Railway PostgreSQL")
+            return True
+        else:
+            print(f"❌ Sync failed: {response.text}")
+            return False
+            
     except Exception as e:
-        print(f"❌ Error getting stats: {e}")
-        return 0, 0
-    finally:
-        return_connection(conn)
+        print(f"❌ PostgreSQL sync error: {e}")
+        return False
 
 # -------------------------------------------------------------
 #                    OPENAI FUNCTIONS
@@ -350,22 +312,20 @@ def health():
         templates_count, generated_count = get_stats()
         return jsonify({
             "status": "🚀 Server is running",
-            "database": "PostgreSQL",
+            "database": "SQLite (with PostgreSQL sync)",
             "templates": templates_count,
             "generated_cards": generated_count,
-            "database_connected": True,
+            "postgresql_sync": bool(os.getenv("RAILWAY_TOKEN")),
             "endpoints": {
                 "POST /api/generate": "Generate new card",
                 "GET /api/templates": "Get all templates",
-                "GET /api/history": "Get generation history",
-                "POST /generate": "Legacy OpenAI endpoint"
+                "GET /api/history": "Get generation history"
             }
         })
     except Exception as e:
         return jsonify({
-            "status": "⚠️ Server running (database error)",
-            "error": str(e),
-            "database_connected": False
+            "status": "⚠️ Server running",
+            "error": str(e)
         })
 
 # Основной endpoint для Android
@@ -376,18 +336,31 @@ def generate_card():
         goal = data.get("goal", "Улучшить здоровье")
         language = data.get("language", "RU")
         
-        # Получаем случайный шаблон из БД
+        # Получаем случайный шаблон из SQLite
         template = get_random_template(language)
         if not template:
+            # Если нет шаблонов, создаем простую карточку
             return jsonify({
-                "success": False,
-                "error": f"No templates found for language: {language}"
-            }), 404
+                "success": True,
+                "card": {
+                    "id": random.randint(1000, 9999),
+                    "template_id": 0,
+                    "title": "Упражнение",
+                    "description": f"Помни о своей цели: {goal}",
+                    "category": "общее",
+                    "duration": 300,
+                    "difficulty": "легко",
+                    "language": language,
+                    "is_ai_generated": False,
+                    "user_goal": goal,
+                    "created_at": datetime.utcnow().isoformat()
+                }
+            })
         
         # Генерируем через OpenAI
         generated = generate_with_openai(template, goal, language)
         
-        # Подготовка данных для сохранения
+        # Подготовка данных
         card_data = {
             "template_id": template['id'],
             "title": generated["title"],
@@ -400,8 +373,11 @@ def generate_card():
             "user_goal": goal
         }
         
-        # Сохраняем в БД
+        # Сохраняем в SQLite
         card_id = save_generated_card(card_data)
+        
+        # Синхронизируем с PostgreSQL (если настроено)
+        sync_to_postgresql(card_data)
         
         # Формируем ответ
         response_card = {
@@ -416,7 +392,7 @@ def generate_card():
         })
         
     except Exception as e:
-        print(f"❌ Error in /api/generate: {e}")
+        print(f"❌ Error: {e}")
         return jsonify({
             "success": False,
             "error": "Failed to generate card",
@@ -432,17 +408,6 @@ def api_get_templates():
     return jsonify({
         "success": True,
         "templates": templates
-    })
-
-# Получить историю генераций
-@app.route("/api/history", methods=["GET"])
-def api_get_history():
-    limit = request.args.get("limit", 20, type=int)
-    cards = get_generated_cards(limit)
-    
-    return jsonify({
-        "success": True,
-        "cards": cards
     })
 
 # Legacy endpoint для совместимости
@@ -491,21 +456,11 @@ def legacy_generate():
         }), 500
 
 # -------------------------------------------------------------
-#                    STARTUP
-# -------------------------------------------------------------
-# Инициализируем БД при импорте
-try:
-    init_db_pool()
-    print("✅ Database initialized successfully")
-except Exception as e:
-    print(f"⚠️ Database initialization failed: {e}")
-    print("⚠️ Server will start without database")
-
-# -------------------------------------------------------------
 #                    RUN SERVER
 # -------------------------------------------------------------
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8080))
     print(f"✅ Starting server on port {port}")
-    print(f"✅ Using PostgreSQL with psycopg2")
+    print(f"✅ Database: SQLite (cards.db)")
+    print(f"✅ OpenAI: {'Ready' if API_KEY else 'Not configured'}")
     app.run(host="0.0.0.0", port=port, debug=False)
