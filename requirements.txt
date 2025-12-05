@@ -2,7 +2,7 @@ Flask==2.3.3
 openai==0.28.1
 python-dotenv==1.0.0
 Flask-SQLAlchemy==3.0.5
-Flask-Migrate==4.0.4
+Flask-Cors==4.0.0
 psycopg2-binary==2.9.9
 gunicorn
 
