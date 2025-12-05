@@ -1,13 +1,15 @@
+# app.py - с SQLite для быстрого старта
 import os
 import json
 import re
 import random
+import sqlite3
 from flask import Flask, request, jsonify
-from flask_sqlalchemy import SQLAlchemy
 from flask_cors import CORS
 from dotenv import load_dotenv
 import openai
 from datetime import datetime
+from contextlib import closing
 
 # -------------------------------------------------------------
 #                    LOAD ENV & INIT APP
@@ -20,141 +22,143 @@ if not API_KEY:
 
 openai.api_key = API_KEY
 app = Flask(__name__)
-CORS(app)  # Включаем CORS для Android
+CORS(app)
 
 # -------------------------------------------------------------
-#                    DATABASE CONFIG (Railway PostgreSQL)
+#                    SQLITE DATABASE
 # -------------------------------------------------------------
-DATABASE_URL = os.getenv('DATABASE_URL', '')
+DB_PATH = "cards.db"
 
-if DATABASE_URL:
-    # Конвертируем для SQLAlchemy
-    if DATABASE_URL.startswith('postgres://'):
-        DATABASE_URL = DATABASE_URL.replace('postgres://', 'postgresql://', 1)
-    app.config['SQLALCHEMY_DATABASE_URI'] = DATABASE_URL
-    print(f"✅ Using PostgreSQL: {DATABASE_URL.split('@')[1] if '@' in DATABASE_URL else 'Connected'}")
-else:
-    # Fallback to SQLite (для локальной разработки)
-    app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///cards.db'
-    print("⚠️ Using SQLite (no DATABASE_URL found)")
+def init_db():
+    """Инициализировать SQLite базу данных"""
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        cursor = conn.cursor()
+        
+        # Таблица шаблонов
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS card_templates (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                category TEXT NOT NULL,
+                base_text TEXT NOT NULL,
+                difficulty TEXT DEFAULT 'легко',
+                duration INTEGER DEFAULT 300,
+                tags TEXT DEFAULT '',
+                language TEXT DEFAULT 'RU',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        
+        # Таблица сгенерированных карточек
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS generated_cards (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                template_id INTEGER NOT NULL,
+                title TEXT NOT NULL,
+                description TEXT NOT NULL,
+                category TEXT NOT NULL,
+                duration INTEGER NOT NULL,
+                difficulty TEXT NOT NULL,
+                language TEXT DEFAULT 'RU',
+                is_ai_generated BOOLEAN DEFAULT 1,
+                user_goal TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        
+        # Проверяем, есть ли демо-шаблоны
+        cursor.execute("SELECT COUNT(*) FROM card_templates")
+        count = cursor.fetchone()[0]
+        
+        if count == 0:
+            # Добавляем демо-шаблоны
+            templates = [
+                ("дыхание", "Сделай {N} глубоких вдохов через нос и медленных выдохов через рот", "легко", 120, "релакс,офис,стресс", "RU"),
+                ("шея_плечи", "Повращай плечами {N} раз вперед и {N} раз назад", "легко", 180, "разминка,офис,сидячая работа", "RU"),
+                ("осанка", "Выпрями спину и удерживай правильную осанку {N} минут", "средне", 300, "осанка,работа,здоровье спины", "RU"),
+                ("глаза", "Отведи взгляд от экрана и сфокусируйся на удаленном объекте {N} секунд", "легко", 60, "зрение,отдых,экран", "RU"),
+                ("ноги", "Встань и потянись, подняв руки вверх на {N} секунд", "легко", 90, "разминка,перерыв,кровообращение", "RU"),
+                ("breathing", "Take {N} deep breaths through your nose and slow exhales through your mouth", "easy", 120, "relax,office,stress", "EN"),
+                ("neck_shoulders", "Rotate your shoulders {N} times forward and {N} times backward", "easy", 180, "warmup,office,sitting", "EN")
+            ]
+            
+            cursor.executemany("""
+                INSERT INTO card_templates (category, base_text, difficulty, duration, tags, language)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, templates)
+        
+        conn.commit()
+        print(f"✅ Database initialized at {DB_PATH}")
+        print(f"✅ Templates in DB: {count if count > 0 else 'added demo templates'}")
 
-app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
-db = SQLAlchemy(app)
-
-# -------------------------------------------------------------
-#                    DATABASE MODELS
-# -------------------------------------------------------------
-class CardTemplate(db.Model):
-    __tablename__ = 'card_templates'
-    
-    id = db.Column(db.Integer, primary_key=True)
-    category = db.Column(db.String(100), nullable=False)
-    base_text = db.Column(db.Text, nullable=False)
-    difficulty = db.Column(db.String(50), default='легко')
-    duration = db.Column(db.Integer, default=300)
-    tags = db.Column(db.String(500), default='')
-    language = db.Column(db.String(10), default='RU')
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
-    
-    def to_dict(self):
-        return {
-            'id': self.id,
-            'category': self.category,
-            'base_text': self.base_text,
-            'difficulty': self.difficulty,
-            'duration': self.duration,
-            'tags': self.tags.split(',') if self.tags else [],
-            'language': self.language,
-            'created_at': self.created_at.isoformat()
-        }
-
-class GeneratedCard(db.Model):
-    __tablename__ = 'generated_cards'
-    
-    id = db.Column(db.Integer, primary_key=True)
-    template_id = db.Column(db.Integer, nullable=False)
-    title = db.Column(db.String(200), nullable=False)
-    description = db.Column(db.Text, nullable=False)
-    category = db.Column(db.String(100), nullable=False)
-    duration = db.Column(db.Integer, nullable=False)
-    difficulty = db.Column(db.String(50), nullable=False)
-    language = db.Column(db.String(10), default='RU')
-    is_ai_generated = db.Column(db.Boolean, default=True)
-    user_goal = db.Column(db.String(200))
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
-    
-    def to_dict(self):
-        return {
-            'id': self.id,
-            'template_id': self.template_id,
-            'title': self.title,
-            'description': self.description,
-            'category': self.category,
-            'duration': self.duration,
-            'difficulty': self.difficulty,
-            'language': self.language,
-            'is_ai_generated': self.is_ai_generated,
-            'user_goal': self.user_goal,
-            'created_at': self.created_at.isoformat()
-        }
+# Инициализируем БД при старте
+init_db()
 
 # -------------------------------------------------------------
-#                    INIT DATABASE
+#                    DATABASE FUNCTIONS
 # -------------------------------------------------------------
-with app.app_context():
-    db.create_all()
-    
-    # Добавляем демо-шаблоны если таблица пустая
-    if CardTemplate.query.count() == 0:
-        add_sample_templates()
-        print("✅ Added sample templates to database")
+def get_db_connection():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row  # Чтобы получать словари
+    return conn
 
-def add_sample_templates():
-    """Добавляем примеры шаблонов в БД"""
-    samples = [
-        CardTemplate(
-            category="дыхание",
-            base_text="Сделай {N} глубоких вдохов через нос и медленных выдохов через рот",
-            difficulty="легко",
-            duration=120,
-            tags="релакс,офис,стресс",
-            language="RU"
-        ),
-        CardTemplate(
-            category="шея_плечи",
-            base_text="Повращай плечами {N} раз вперед и {N} раз назад",
-            difficulty="легко",
-            duration=180,
-            tags="разминка,офис,сидячая работа",
-            language="RU"
-        ),
-        CardTemplate(
-            category="осанка",
-            base_text="Выпрями спину и удерживай правильную осанку {N} минут",
-            difficulty="средне",
-            duration=300,
-            tags="осанка,работа,здоровье спины",
-            language="RU"
-        ),
-        CardTemplate(
-            category="глаза",
-            base_text="Отведи взгляд от экрана и сфокусируйся на удаленном объекте {N} секунд",
-            difficulty="легко",
-            duration=60,
-            tags="зрение,отдых,экран",
-            language="RU"
+def get_random_template(language="RU"):
+    """Получить случайный шаблон из БД"""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT * FROM card_templates WHERE language = ? ORDER BY RANDOM() LIMIT 1",
+            (language,)
         )
-    ]
-    
-    for sample in samples:
-        db.session.add(sample)
-    
-    db.session.commit()
+        row = cursor.fetchone()
+        return dict(row) if row else None
+
+def save_generated_card(card_data):
+    """Сохранить сгенерированную карточку в БД"""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO generated_cards 
+            (template_id, title, description, category, duration, difficulty, language, is_ai_generated, user_goal)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            card_data['template_id'],
+            card_data['title'],
+            card_data['description'],
+            card_data['category'],
+            card_data['duration'],
+            card_data['difficulty'],
+            card_data['language'],
+            card_data['is_ai_generated'],
+            card_data['user_goal']
+        ))
+        card_id = cursor.lastrowid
+        conn.commit()
+        return card_id
+
+def get_templates(language="RU"):
+    """Получить все шаблоны"""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT * FROM card_templates WHERE language = ?",
+            (language,)
+        )
+        return [dict(row) for row in cursor.fetchall()]
+
+def get_generated_cards(limit=20):
+    """Получить историю генераций"""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT * FROM generated_cards ORDER BY created_at DESC LIMIT ?",
+            (limit,)
+        )
+        return [dict(row) for row in cursor.fetchall()]
 
 # -------------------------------------------------------------
-#                    HELPER FUNCTIONS
+#                    OPENAI FUNCTIONS
 # -------------------------------------------------------------
-def generate_with_openai(template, goal, energy, language):
+def generate_with_openai(template, goal, language):
     """Генерирует вариацию через OpenAI"""
     
     lang_text = "русском" if language == "RU" else "английском"
@@ -163,12 +167,11 @@ def generate_with_openai(template, goal, energy, language):
     prompt = f"""
 Напиши на {lang_text} языке.
 
-Шаблон упражнения: "{template.base_text}"
-Категория: {template.category}
-Длительность: {template.duration} секунд
+Шаблон упражнения: "{template['base_text']}"
+Категория: {template['category']}
+Длительность: {template['duration']} секунд
 
 Цель пользователя: {goal}
-Уровень энергии: {energy}
 
 Создай интересную вариацию этого упражнения:
 - Используй число {n_value} вместо {{N}}
@@ -200,9 +203,9 @@ def generate_with_openai(template, goal, energy, language):
         if match:
             data = json.loads(match.group(0))
             return {
-                "title": data.get("title", template.category),
-                "description": data.get("description", template.base_text.replace("{N}", str(n_value))),
-                "duration": data.get("duration", template.duration),
+                "title": data.get("title", template['category']),
+                "description": data.get("description", template['base_text'].replace("{N}", str(n_value))),
+                "duration": data.get("duration", template['duration']),
                 "is_ai_generated": True
             }
             
@@ -211,9 +214,9 @@ def generate_with_openai(template, goal, energy, language):
     
     # Fallback
     return {
-        "title": template.category,
-        "description": template.base_text.replace("{N}", str(random.randint(3, 10))),
-        "duration": template.duration,
+        "title": template['category'],
+        "description": template['base_text'].replace("{N}", str(random.randint(3, 10))),
+        "duration": template['duration'],
         "is_ai_generated": False
     }
 
@@ -223,14 +226,24 @@ def generate_with_openai(template, goal, energy, language):
 
 @app.route("/")
 def health():
-    templates_count = CardTemplate.query.count()
-    generated_count = GeneratedCard.query.count()
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM card_templates")
+        templates_count = cursor.fetchone()[0]
+        
+        cursor.execute("SELECT COUNT(*) FROM generated_cards")
+        generated_count = cursor.fetchone()[0]
     
     return jsonify({
         "status": "🚀 Server is running",
-        "database": "PostgreSQL" if DATABASE_URL else "SQLite",
+        "database": "SQLite",
         "templates": templates_count,
-        "generated_cards": generated_count
+        "generated_cards": generated_count,
+        "endpoints": {
+            "POST /api/generate": "Generate new card",
+            "GET /api/templates": "Get all templates",
+            "GET /api/history": "Get generation history"
+        }
     })
 
 # Основной endpoint для Android
@@ -242,37 +255,41 @@ def generate_card():
         language = data.get("language", "RU")
         
         # Получаем случайный шаблон из БД
-        templates = CardTemplate.query.filter_by(language=language).all()
-        if not templates:
+        template = get_random_template(language)
+        if not template:
             return jsonify({
                 "success": False,
-                "error": "No templates found"
+                "error": f"No templates found for language: {language}"
             }), 404
         
-        template = random.choice(templates)
-        
         # Генерируем через OpenAI
-        generated = generate_with_openai(template, goal, "medium", language)
+        generated = generate_with_openai(template, goal, language)
+        
+        # Подготовка данных для сохранения
+        card_data = {
+            "template_id": template['id'],
+            "title": generated["title"],
+            "description": generated["description"],
+            "category": template['category'],
+            "duration": generated["duration"],
+            "difficulty": template['difficulty'],
+            "language": language,
+            "is_ai_generated": generated["is_ai_generated"],
+            "user_goal": goal
+        }
         
         # Сохраняем в БД
-        new_card = GeneratedCard(
-            template_id=template.id,
-            title=generated["title"],
-            description=generated["description"],
-            category=template.category,
-            duration=generated["duration"],
-            difficulty=template.difficulty,
-            language=language,
-            is_ai_generated=generated["is_ai_generated"],
-            user_goal=goal
-        )
+        card_id = save_generated_card(card_data)
         
-        db.session.add(new_card)
-        db.session.commit()
+        # Формируем ответ
+        response_card = {
+            "id": card_id,
+            **card_data
+        }
         
         return jsonify({
             "success": True,
-            "card": new_card.to_dict()
+            "card": response_card
         })
         
     except Exception as e:
@@ -284,25 +301,70 @@ def generate_card():
 
 # Получить все шаблоны
 @app.route("/api/templates", methods=["GET"])
-def get_templates():
+def api_get_templates():
     language = request.args.get("language", "RU")
-    templates = CardTemplate.query.filter_by(language=language).all()
+    templates = get_templates(language)
     
     return jsonify({
         "success": True,
-        "templates": [t.to_dict() for t in templates]
+        "templates": templates
     })
 
 # Получить историю генераций
 @app.route("/api/history", methods=["GET"])
-def get_history():
-    limit = request.args.get("limit", 50, type=int)
-    cards = GeneratedCard.query.order_by(GeneratedCard.created_at.desc()).limit(limit).all()
+def api_get_history():
+    limit = request.args.get("limit", 20, type=int)
+    cards = get_generated_cards(limit)
     
     return jsonify({
         "success": True,
-        "cards": [c.to_dict() for c in cards]
+        "cards": cards
     })
+
+# Legacy endpoint для совместимости
+@app.route("/generate", methods=["POST"])
+def legacy_generate():
+    try:
+        data = request.json
+        goal = data.get("goal", "Улучшить здоровье")
+        language = data.get("language", "RU")
+        
+        prompt = f"""
+{'Пиши на русском' if language == 'RU' else 'Write in English'}
+
+Цель пользователя: {goal}
+
+Создай короткое упражнение для мобильного приложения.
+Верни JSON: {{"title": "...", "description": "..."}}
+"""
+        
+        response = openai.ChatCompletion.create(
+            model="gpt-3.5-turbo",
+            messages=[
+                {"role": "system", "content": "Ты создаешь упражнения."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.7,
+            max_tokens=150
+        )
+        
+        raw = response.choices[0].message.content
+        match = re.search(r"\{.*\}", raw, re.DOTALL)
+        
+        if match:
+            data = json.loads(match.group(0))
+            return jsonify(data)
+        else:
+            return jsonify({
+                "title": "Упражнение",
+                "description": f"Помни о цели: {goal}"
+            })
+            
+    except Exception as e:
+        return jsonify({
+            "title": "Ошибка",
+            "description": str(e)
+        }), 500
 
 # -------------------------------------------------------------
 #                    RUN SERVER
@@ -310,5 +372,5 @@ def get_history():
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8080))
     print(f"✅ Server starting on port {port}")
-    print(f"✅ Database: {'PostgreSQL' if DATABASE_URL else 'SQLite'}")
+    print(f"✅ Database: SQLite ({DB_PATH})")
     app.run(host="0.0.0.0", port=port, debug=False)
