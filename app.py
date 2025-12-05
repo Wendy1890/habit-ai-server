@@ -1,15 +1,16 @@
-# app.py - с SQLite для быстрого старта
+# app.py - с asyncpg для PostgreSQL
 import os
 import json
 import re
 import random
-import sqlite3
+import asyncio
+import asyncpg
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from dotenv import load_dotenv
 import openai
 from datetime import datetime
-from contextlib import closing
+from contextlib import asynccontextmanager
 
 # -------------------------------------------------------------
 #                    LOAD ENV & INIT APP
@@ -24,50 +25,67 @@ openai.api_key = API_KEY
 app = Flask(__name__)
 CORS(app)
 
-# -------------------------------------------------------------
-#                    SQLITE DATABASE
-# -------------------------------------------------------------
-DB_PATH = "cards.db"
+# PostgreSQL connection string от Railway
+DATABASE_URL = os.getenv('DATABASE_URL')
+print(f"✅ PostgreSQL URL: {DATABASE_URL.split('@')[1] if DATABASE_URL and '@' in DATABASE_URL else 'Configured'}")
 
-def init_db():
-    """Инициализировать SQLite базу данных"""
-    with closing(sqlite3.connect(DB_PATH)) as conn:
-        cursor = conn.cursor()
-        
+# -------------------------------------------------------------
+#                    DATABASE POOL
+# -------------------------------------------------------------
+pool = None
+
+async def create_db_pool():
+    """Создать пул подключений к PostgreSQL"""
+    global pool
+    try:
+        pool = await asyncpg.create_pool(
+            DATABASE_URL,
+            min_size=1,
+            max_size=10,
+            command_timeout=60
+        )
+        print("✅ PostgreSQL connection pool created")
+        await init_tables()
+    except Exception as e:
+        print(f"❌ Database connection error: {e}")
+        raise
+
+async def init_tables():
+    """Инициализировать таблицы в БД"""
+    async with pool.acquire() as conn:
         # Таблица шаблонов
-        cursor.execute("""
+        await conn.execute("""
             CREATE TABLE IF NOT EXISTS card_templates (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                category TEXT NOT NULL,
+                id SERIAL PRIMARY KEY,
+                category VARCHAR(100) NOT NULL,
                 base_text TEXT NOT NULL,
-                difficulty TEXT DEFAULT 'легко',
+                difficulty VARCHAR(50) DEFAULT 'легко',
                 duration INTEGER DEFAULT 300,
                 tags TEXT DEFAULT '',
-                language TEXT DEFAULT 'RU',
+                language VARCHAR(10) DEFAULT 'RU',
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
         
         # Таблица сгенерированных карточек
-        cursor.execute("""
+        await conn.execute("""
             CREATE TABLE IF NOT EXISTS generated_cards (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 template_id INTEGER NOT NULL,
-                title TEXT NOT NULL,
+                title VARCHAR(200) NOT NULL,
                 description TEXT NOT NULL,
-                category TEXT NOT NULL,
+                category VARCHAR(100) NOT NULL,
                 duration INTEGER NOT NULL,
-                difficulty TEXT NOT NULL,
-                language TEXT DEFAULT 'RU',
-                is_ai_generated BOOLEAN DEFAULT 1,
-                user_goal TEXT,
+                difficulty VARCHAR(50) NOT NULL,
+                language VARCHAR(10) DEFAULT 'RU',
+                is_ai_generated BOOLEAN DEFAULT TRUE,
+                user_goal VARCHAR(200),
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
         
         # Проверяем, есть ли демо-шаблоны
-        cursor.execute("SELECT COUNT(*) FROM card_templates")
-        count = cursor.fetchone()[0]
+        count = await conn.fetchval("SELECT COUNT(*) FROM card_templates")
         
         if count == 0:
             # Добавляем демо-шаблоны
@@ -81,46 +99,46 @@ def init_db():
                 ("neck_shoulders", "Rotate your shoulders {N} times forward and {N} times backward", "easy", 180, "warmup,office,sitting", "EN")
             ]
             
-            cursor.executemany("""
-                INSERT INTO card_templates (category, base_text, difficulty, duration, tags, language)
-                VALUES (?, ?, ?, ?, ?, ?)
-            """, templates)
-        
-        conn.commit()
-        print(f"✅ Database initialized at {DB_PATH}")
-        print(f"✅ Templates in DB: {count if count > 0 else 'added demo templates'}")
-
-# Инициализируем БД при старте
-init_db()
+            for template in templates:
+                await conn.execute("""
+                    INSERT INTO card_templates (category, base_text, difficulty, duration, tags, language)
+                    VALUES ($1, $2, $3, $4, $5, $6)
+                """, *template)
+            
+            print(f"✅ Added {len(templates)} demo templates to PostgreSQL")
+        else:
+            print(f"✅ Database already has {count} templates")
 
 # -------------------------------------------------------------
-#                    DATABASE FUNCTIONS
+#                    DATABASE FUNCTIONS (async)
 # -------------------------------------------------------------
-def get_db_connection():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row  # Чтобы получать словари
-    return conn
+@asynccontextmanager
+async def get_connection():
+    """Контекстный менеджер для подключения к БД"""
+    conn = await pool.acquire()
+    try:
+        yield conn
+    finally:
+        await pool.release(conn)
 
-def get_random_template(language="RU"):
+async def get_random_template(language="RU"):
     """Получить случайный шаблон из БД"""
-    with get_db_connection() as conn:
-        cursor = conn.cursor()
-        cursor.execute(
-            "SELECT * FROM card_templates WHERE language = ? ORDER BY RANDOM() LIMIT 1",
-            (language,)
+    async with get_connection() as conn:
+        row = await conn.fetchrow(
+            "SELECT * FROM card_templates WHERE language = $1 ORDER BY RANDOM() LIMIT 1",
+            language
         )
-        row = cursor.fetchone()
         return dict(row) if row else None
 
-def save_generated_card(card_data):
+async def save_generated_card(card_data):
     """Сохранить сгенерированную карточку в БД"""
-    with get_db_connection() as conn:
-        cursor = conn.cursor()
-        cursor.execute("""
+    async with get_connection() as conn:
+        card_id = await conn.fetchval("""
             INSERT INTO generated_cards 
             (template_id, title, description, category, duration, difficulty, language, is_ai_generated, user_goal)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            RETURNING id
+        """, 
             card_data['template_id'],
             card_data['title'],
             card_data['description'],
@@ -130,30 +148,33 @@ def save_generated_card(card_data):
             card_data['language'],
             card_data['is_ai_generated'],
             card_data['user_goal']
-        ))
-        card_id = cursor.lastrowid
-        conn.commit()
+        )
         return card_id
 
-def get_templates(language="RU"):
+async def get_templates(language="RU"):
     """Получить все шаблоны"""
-    with get_db_connection() as conn:
-        cursor = conn.cursor()
-        cursor.execute(
-            "SELECT * FROM card_templates WHERE language = ?",
-            (language,)
+    async with get_connection() as conn:
+        rows = await conn.fetch(
+            "SELECT * FROM card_templates WHERE language = $1",
+            language
         )
-        return [dict(row) for row in cursor.fetchall()]
+        return [dict(row) for row in rows]
 
-def get_generated_cards(limit=20):
+async def get_generated_cards(limit=20):
     """Получить историю генераций"""
-    with get_db_connection() as conn:
-        cursor = conn.cursor()
-        cursor.execute(
-            "SELECT * FROM generated_cards ORDER BY created_at DESC LIMIT ?",
-            (limit,)
+    async with get_connection() as conn:
+        rows = await conn.fetch(
+            "SELECT * FROM generated_cards ORDER BY created_at DESC LIMIT $1",
+            limit
         )
-        return [dict(row) for row in cursor.fetchall()]
+        return [dict(row) for row in rows]
+
+async def get_stats():
+    """Получить статистику БД"""
+    async with get_connection() as conn:
+        templates_count = await conn.fetchval("SELECT COUNT(*) FROM card_templates")
+        generated_count = await conn.fetchval("SELECT COUNT(*) FROM generated_cards")
+        return templates_count, generated_count
 
 # -------------------------------------------------------------
 #                    OPENAI FUNCTIONS
@@ -221,30 +242,55 @@ def generate_with_openai(template, goal, language):
     }
 
 # -------------------------------------------------------------
+#                    SYNC WRAPPERS для Flask (Flask не async)
+# -------------------------------------------------------------
+def run_async(coro):
+    """Запустить асинхронную функцию синхронно"""
+    return asyncio.run(coro)
+
+# Синхронные обертки для Flask endpoints
+def sync_get_random_template(language="RU"):
+    return run_async(get_random_template(language))
+
+def sync_save_generated_card(card_data):
+    return run_async(save_generated_card(card_data))
+
+def sync_get_templates(language="RU"):
+    return run_async(get_templates(language))
+
+def sync_get_generated_cards(limit=20):
+    return run_async(get_generated_cards(limit))
+
+def sync_get_stats():
+    return run_async(get_stats())
+
+# -------------------------------------------------------------
 #                    API ENDPOINTS
 # -------------------------------------------------------------
 
 @app.route("/")
 def health():
-    with get_db_connection() as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT COUNT(*) FROM card_templates")
-        templates_count = cursor.fetchone()[0]
-        
-        cursor.execute("SELECT COUNT(*) FROM generated_cards")
-        generated_count = cursor.fetchone()[0]
-    
-    return jsonify({
-        "status": "🚀 Server is running",
-        "database": "SQLite",
-        "templates": templates_count,
-        "generated_cards": generated_count,
-        "endpoints": {
-            "POST /api/generate": "Generate new card",
-            "GET /api/templates": "Get all templates",
-            "GET /api/history": "Get generation history"
-        }
-    })
+    """Health check endpoint"""
+    try:
+        templates_count, generated_count = sync_get_stats()
+        return jsonify({
+            "status": "🚀 Server is running",
+            "database": "PostgreSQL (asyncpg)",
+            "templates": templates_count,
+            "generated_cards": generated_count,
+            "database_url_short": DATABASE_URL.split('@')[1] if DATABASE_URL and '@' in DATABASE_URL else "configured",
+            "endpoints": {
+                "POST /api/generate": "Generate new card",
+                "GET /api/templates": "Get all templates",
+                "GET /api/history": "Get generation history"
+            }
+        })
+    except Exception as e:
+        return jsonify({
+            "status": "⚠️ Server error",
+            "error": str(e),
+            "database_url": DATABASE_URL[:50] + "..." if DATABASE_URL else "not configured"
+        }), 500
 
 # Основной endpoint для Android
 @app.route("/api/generate", methods=["POST"])
@@ -255,7 +301,7 @@ def generate_card():
         language = data.get("language", "RU")
         
         # Получаем случайный шаблон из БД
-        template = get_random_template(language)
+        template = sync_get_random_template(language)
         if not template:
             return jsonify({
                 "success": False,
@@ -279,12 +325,13 @@ def generate_card():
         }
         
         # Сохраняем в БД
-        card_id = save_generated_card(card_data)
+        card_id = sync_save_generated_card(card_data)
         
         # Формируем ответ
         response_card = {
             "id": card_id,
-            **card_data
+            **card_data,
+            "created_at": datetime.utcnow().isoformat()
         }
         
         return jsonify({
@@ -293,17 +340,18 @@ def generate_card():
         })
         
     except Exception as e:
-        print(f"Error: {e}")
+        print(f"Error in /api/generate: {e}")
         return jsonify({
             "success": False,
-            "error": str(e)
+            "error": "Failed to generate card",
+            "message": str(e)
         }), 500
 
 # Получить все шаблоны
 @app.route("/api/templates", methods=["GET"])
 def api_get_templates():
     language = request.args.get("language", "RU")
-    templates = get_templates(language)
+    templates = sync_get_templates(language)
     
     return jsonify({
         "success": True,
@@ -314,7 +362,7 @@ def api_get_templates():
 @app.route("/api/history", methods=["GET"])
 def api_get_history():
     limit = request.args.get("limit", 20, type=int)
-    cards = get_generated_cards(limit)
+    cards = sync_get_generated_cards(limit)
     
     return jsonify({
         "success": True,
@@ -367,10 +415,37 @@ def legacy_generate():
         }), 500
 
 # -------------------------------------------------------------
+#                    STARTUP & SHUTDOWN
+# -------------------------------------------------------------
+@app.before_first_request
+def startup():
+    """Инициализация при старте сервера"""
+    try:
+        run_async(create_db_pool())
+        print("✅ Server initialized successfully")
+    except Exception as e:
+        print(f"❌ Startup error: {e}")
+
+@app.teardown_appcontext
+def shutdown(exception=None):
+    """Очистка при завершении"""
+    if pool:
+        run_async(pool.close())
+        print("✅ Database pool closed")
+
+# -------------------------------------------------------------
 #                    RUN SERVER
 # -------------------------------------------------------------
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8080))
-    print(f"✅ Server starting on port {port}")
-    print(f"✅ Database: SQLite ({DB_PATH})")
-    app.run(host="0.0.0.0", port=port, debug=False)
+    print(f"✅ Starting server on port {port}")
+    print(f"✅ Using asyncpg for PostgreSQL")
+    
+    # Инициализируем пул при запуске
+    try:
+        run_async(create_db_pool())
+    except Exception as e:
+        print(f"⚠️ Could not connect to database: {e}")
+        print("⚠️ Server will start without database connection")
+    
+    app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
